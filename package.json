@@ -1,0 +1,72 @@
+{
+  "name": "boj-mock-test",
+  "publisher": "gmyun1999",
+  "displayName": "boj-mock-test",
+  "description": "Pick random Baekjoon problems for mock coding tests",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.107.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:boj-mock-test.pick3",
+    "onCommand:boj-mock-test.toggleHandCoding"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "boj-mock-test.pick3",
+        "title": "BOJ: Pick Random Problems"
+      },
+      {
+        "command": "boj-mock-test.toggleHandCoding",
+        "title": "BOJ: 손코딩 모드 ON/OFF"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "boj-mock-test",
+          "title": "boj-mock-test",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "boj-mock-test": [
+        {
+          "id": "boj-mock-test.view",
+          "name": "boj-mock-test",
+          "type": "webview"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "yarn run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "yarn run compile && yarn run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/cheerio": "^1.0.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@types/vscode": "1.107.0",
+    "@typescript-eslint/eslint-plugin": "^8.39.0",
+    "@typescript-eslint/parser": "^8.39.0",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.32.0",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2"
+  }
+}
