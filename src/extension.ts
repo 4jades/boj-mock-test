@@ -1,3 +1,4 @@
+// src/extension.ts
 import * as vscode from "vscode";
 import * as cheerio from "cheerio";
 import { spawn } from "child_process";
@@ -45,12 +46,28 @@ type LangSpec = {
 
 const HAND_CODING_KEY = "bojMockTest.handCodingMode";
 
+/**
+ * Sidebar View (Activity Bar / Side Bar WebviewView)
+ * - 손코딩 모드 ON/OFF 버튼 색상 변경: ON일 때 primary, OFF일 때 secondary 유지
+ */
 class BojMockTestViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "boj-mock-test.view";
+  private view?: vscode.WebviewView;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
+  public postHandCodingState(enabled: boolean) {
+    if (!this.view) return;
+    try {
+      this.view.webview.postMessage({ type: "handCodingState", enabled: !!enabled });
+    } catch {
+      // ignore
+    }
+  }
+
   resolveWebviewView(webviewView: vscode.WebviewView) {
+    this.view = webviewView;
+
     const webview = webviewView.webview;
 
     webview.options = {
@@ -70,6 +87,12 @@ class BojMockTestViewProvider implements vscode.WebviewViewProvider {
 
       if (msg.type === "toggleIDE") {
         await vscode.commands.executeCommand("boj-mock-test.toggleHandCoding");
+        return;
+      }
+
+      if (msg.type === "ready") {
+        const current = this.context.globalState.get<boolean>(HAND_CODING_KEY, false);
+        this.postHandCodingState(!!current);
         return;
       }
     });
@@ -106,6 +129,7 @@ class BojMockTestViewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-foreground);
       border-color: var(--vscode-panel-border);
     }
+    .hint { opacity: 0.75; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -119,18 +143,41 @@ class BojMockTestViewProvider implements vscode.WebviewViewProvider {
   <div class="section">
     <div class="sectionTitle">IDE 제어</div>
     <button class="btn secondary" id="toggleIDE">손코딩 모드 ON/OFF</button>
+    <div class="hint" id="hcHint"></div>
   </div>
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    document.getElementById("startMock").addEventListener("click", () => {vscode.postMessage({ type: "startMock" });});
-    document.getElementById("toggleIDE").addEventListener("click", () => vscode.postMessage({ type: "toggleIDE" }));
+    const toggleBtn = document.getElementById("toggleIDE");
+    const hcHint = document.getElementById("hcHint");
+
+    function applyHandCodingState(enabled) {
+      toggleBtn.classList.toggle("secondary", !enabled);
+      hcHint.textContent = enabled ? "손코딩 모드: ON" : "손코딩 모드: OFF";
+    }
+
+    document.getElementById("startMock").addEventListener("click", () => {
+      vscode.postMessage({ type: "startMock" });
+    });
+
+    document.getElementById("toggleIDE").addEventListener("click", () => {
+      vscode.postMessage({ type: "toggleIDE" });
+    });
+
+    window.addEventListener("message", (event) => {
+      const msg = event.data;
+      if (!msg) return;
+      if (msg.type === "handCodingState") {
+        applyHandCodingState(!!msg.enabled);
+      }
+    });
+
+    vscode.postMessage({ type: "ready" });
   </script>
 </body>
 </html>`;
   }
 }
-
 
 function shuffle<T>(arr: T[]): T[] {
   const a = arr.slice();
@@ -547,8 +594,28 @@ async function gradeOne(lang: LangSpec, srcPath: string, workDir: string, sample
 
   return {
     ok: false,
-    detail: `오답\n\n[기대]\n${exp}\n\n[출력]\n${got}`.trim(),
+    detail: `[기대]\n${exp}\n\n[출력]\n${got}`.trim(),
   };
+}
+
+async function runOnly(lang: LangSpec, srcPath: string, workDir: string, input: string, timeoutMs: number) {
+  const r = await runProgram(lang, srcPath, workDir, input ?? "", timeoutMs);
+
+  if (r.timedOut) return { ok: false, detail: `시간 초과 (${timeoutMs}ms)\n${(r.stderr ?? "").trim()}`.trim() };
+
+  if (r.code !== 0) {
+    const err = (r.stderr ?? "").trim();
+    const out = normOut(r.stdout);
+    return {
+      ok: false,
+      detail: `런타임 에러\n\n[stdout]\n${out}\n\n[stderr]\n${err}`.trim(),
+    };
+  }
+
+  const out = normOut(r.stdout);
+  const err = normOut(r.stderr);
+  const tail = err ? `\n\n[stderr]\n${err}` : "";
+  return { ok: true, detail: `[stdout]\n${out}${tail}`.trim() };
 }
 
 function fmt(ms: number) {
@@ -568,6 +635,54 @@ function esc(s: string) {
 
 function runResultRow(idx: number, ok: boolean, detail: string) {
   const badge = ok
+    ? `<span class="badge ok"><span class="emoji">✅</span>PASS</span>`
+    : `<span class="badge fail"><span class="emoji">❌</span>FAIL</span>`;
+
+  let detailHtml = "";
+  if (detail) {
+    const d = (detail ?? "").replace(/\r\n/g, "\n").trimEnd();
+    // "오답\n\n[기대]\n...\n\n[출력]\n..." 패턴이면 2컬럼으로 렌더
+    const m = d.match(/^(?:\s*오답\s*\n\s*\n)?\[기대\]\n([\s\S]*?)\n\s*\n\[출력\]\n([\s\S]*)\s*$/);
+    if (m) {
+      const exp = esc(m[1] ?? "");
+      const got = esc(m[2] ?? "");
+      detailHtml = `
+        <div class="grid2">
+          <div>
+            <div style="font-weight:900;margin-bottom:6px;">기대</div>
+            <div class="card" style="padding:10px;">
+              <pre class="mono" style="margin:0;">${exp}</pre>
+            </div>
+          </div>
+
+          <div>
+            <div style="font-weight:900;margin-bottom:6px;">출력</div>
+            <div class="card" style="padding:10px;">
+              <pre class="mono" style="margin:0;">${got}</pre>
+            </div>
+          </div>
+        </div>
+      `;
+    } else {
+      // 나머지(런타임 에러/시간초과 등)는 기존처럼 그대로
+      detailHtml = `<pre class="mono">${esc(d)}</pre>`;
+    }
+  }
+
+  return `
+    <div class="resultRow" id="rr-${idx}">
+      <div class="rowHead">
+        <div class="mono"><b>예제 ${idx}</b></div>
+        ${badge}
+      </div>
+      ${detailHtml}
+    </div>
+  `;
+}
+
+
+function runCustomRow(label: string, ok: boolean, detail: string) {
+  const badge = ok
     ? `<span class="badge ok"><span class="emoji">⭕</span>PASS</span>`
     : `<span class="badge fail"><span class="emoji">❌</span>FAIL</span>`;
 
@@ -575,7 +690,7 @@ function runResultRow(idx: number, ok: boolean, detail: string) {
   return `
     <div class="resultRow">
       <div class="rowHead">
-        <div class="mono"><b>예제 ${idx}</b></div>
+        <div class="mono"><b>${esc(label)}</b></div>
         ${badge}
       </div>
       ${detailHtml}
@@ -668,6 +783,34 @@ function getWebviewHtml(webview: vscode.Webview) {
     }
     .btn:disabled { opacity: 0.5; cursor: default; }
 
+    .iconBtn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      border: 1px solid var(--vscode-panel-border);
+      background: transparent;
+      color: var(--vscode-editor-foreground);
+      cursor: pointer;
+      font-weight: 900;
+      font-size: 11px;
+    }
+    .iconBtn:hover { border-color: var(--vscode-focusBorder); }
+    .iconBtn:disabled { opacity: 0.5; cursor: default; }
+
+    /* 실행(▶)은 초록 */
+    .runBtn {
+      color: #2ea043;
+      border-color: color-mix(in srgb, #2ea043 55%, var(--vscode-panel-border));
+      background: color-mix(in srgb, #2ea043 10%, transparent);
+    }
+    .runBtn:hover {
+      border-color: color-mix(in srgb, #2ea043 75%, var(--vscode-focusBorder));
+      background: color-mix(in srgb, #2ea043 16%, transparent);
+    }
+
     .section { margin-top: 18px; }
     .section h2 {
       font-size: 13px;
@@ -745,6 +888,55 @@ function getWebviewHtml(webview: vscode.Webview) {
 
     .resultRow { margin-bottom: 14px; }
     .rowHead { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+
+    .sampleHead {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 12px; /* 예제 텍스트에 붙게 */
+      margin: 0 0 10px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 90px;
+      border-radius: 12px;
+      border: 1px solid var(--vscode-panel-border);
+      background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-editorWidget-background));
+      color: var(--vscode-editor-foreground);
+      font-family: var(--vscode-editor-font-family);
+      padding: 10px;
+      resize: vertical;
+      box-sizing: border-box;
+    }
+
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .tcItem {
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 12px;
+      padding: 10px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 95%, var(--vscode-editorWidget-background));
+      margin-top: 10px;
+    }
+
+    .tcTop {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .tcLabel { font-weight: 900; }
+    .tcBtns { display:flex; gap:8px; align-items:center; }
+
+    /* 실행 결과로 스크롤 여백 */
+    #runSection { scroll-margin-top: 14px; }
   </style>
 </head>
 <body>
@@ -765,16 +957,11 @@ function getWebviewHtml(webview: vscode.Webview) {
 
     <div class="right">
       <div class="toolbar">
-        <button id="openBtn" class="btn secondary" disabled>원문 열기</button>
-        <button id="runAllBtn" class="btn" disabled>전체 예제 Run</button>
-        <select id="sampleSel" class="btn secondary" disabled></select>
-        <button id="runOneBtn" class="btn" disabled>예제 Run</button>
-        <span id="runHint" class="muted"></span>
       </div>
 
-      <div id="content" class="muted">좌측에서 문제를 선택하세요.</div>
+      <div id="content" class="muted">불러오는 중...</div>
 
-      <div class="section">
+      <div class="section" id="runSection">
         <h2>실행 결과</h2>
         <div id="runHost" class="card muted">아직 실행하지 않았습니다.</div>
       </div>
@@ -786,27 +973,18 @@ function getWebviewHtml(webview: vscode.Webview) {
 
     let problems = [];
     let activeId = null;
-    let activeUrl = null;
     let hideMeta = false;
     let examFinished = false;
 
+    // { id, input, output }
+    let customCases = [];
+
     const listEl = document.getElementById("list");
     const contentEl = document.getElementById("content");
-    const openBtn = document.getElementById("openBtn");
 
-    const runAllBtn = document.getElementById("runAllBtn");
-    const runOneBtn = document.getElementById("runOneBtn");
-    const sampleSel = document.getElementById("sampleSel");
-    const runHint = document.getElementById("runHint");
     const runHost = document.getElementById("runHost");
     const timerEl = document.getElementById("timer");
     const finishBtn = document.getElementById("finishBtn");
-
-    function setRunEnabled(enabled) {
-      runAllBtn.disabled = !enabled || examFinished;
-      runOneBtn.disabled = !enabled || examFinished;
-      sampleSel.disabled = !enabled || examFinished;
-    }
 
     function escapeHtml(s) {
       return (s || "")
@@ -815,26 +993,24 @@ function getWebviewHtml(webview: vscode.Webview) {
         .replaceAll(">", "&gt;");
     }
 
-    openBtn.addEventListener("click", () => {
-      if (hideMeta) return;
-      if (!activeUrl) return;
-      vscode.postMessage({ type: "openExternal", url: activeUrl });
-    });
+    function shortText(s, maxLen) {
+      const t = (s || "").trim();
+      if (t.length <= maxLen) return t;
+      return t.slice(0, maxLen) + "...";
+    }
 
-    runAllBtn.addEventListener("click", () => {
-      if (!activeId) return;
-      if (examFinished) return;
-      runHint.textContent = "실행 중...";
-      vscode.postMessage({ type: "runSample", problemId: activeId, mode: "all" });
-    });
+    function genId() {
+      return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    }
 
-    runOneBtn.addEventListener("click", () => {
-      if (!activeId) return;
-      if (examFinished) return;
-      const idx = Number(sampleSel.value || "0");
-      runHint.textContent = "실행 중...";
-      vscode.postMessage({ type: "runSample", problemId: activeId, mode: String(idx) });
-    });
+    function scrollToRunResult(target) {
+      const el =
+        target === "ex1"
+          ? document.getElementById("ex-1")
+          : document.getElementById("runSection");
+      if (!el) return;
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
 
     finishBtn.addEventListener("click", () => {
       if (examFinished) return;
@@ -865,16 +1041,15 @@ function getWebviewHtml(webview: vscode.Webview) {
           if (examFinished) return;
 
           const id = Number(div.dataset.pid);
-          activeId = id;
-          activeUrl = null;
+          if (!id) return;
 
-          openBtn.disabled = true;
-          setRunEnabled(false);
-          runHint.textContent = "";
+          activeId = id;
+
           runHost.innerHTML = '<div class="muted">아직 실행하지 않았습니다.</div>';
 
           renderList();
           contentEl.innerHTML = '<div class="muted">불러오는 중...</div>';
+
           vscode.postMessage({ type: "selectProblem", problemId: id });
         });
 
@@ -882,42 +1057,57 @@ function getWebviewHtml(webview: vscode.Webview) {
       });
     }
 
+    function attachExampleRunHandlers(sampleCount) {
+      // 전체(샘플 + 추가) Run
+      const allBtn = document.getElementById("runAllInline");
+      if (allBtn) {
+        allBtn.addEventListener("click", () => {
+          if (!activeId) return;
+          if (examFinished) return;
+          vscode.postMessage({ type: "runAll", problemId: activeId, cases: customCases });
+        });
+      }
+
+      // 개별 예제 Run (샘플/커스텀 공통)
+      contentEl.addEventListener("click", (ev) => {
+        const t = ev.target;
+        if (!t) return;
+
+        const btn = t.closest && t.closest("button[data-run='example']");
+        if (!btn) return;
+
+        if (!activeId) return;
+        if (examFinished) return;
+
+        const kind = String(btn.dataset.kind || "sample"); // sample | custom
+        const idx = Number(btn.dataset.idx || "0"); // sample idx or custom idx
+        if (Number.isNaN(idx)) return;
+
+        if (kind === "sample") {
+          vscode.postMessage({ type: "runOneSample", problemId: activeId, idx });
+          return;
+        }
+
+        if (kind === "custom") {
+          const c = customCases[idx];
+          if (!c) return;
+          const exampleNo = sampleCount + idx + 1;
+          vscode.postMessage({
+            type: "runOneCustom",
+            problemId: activeId,
+            exampleNo,
+            input: c.input || "",
+            expected: c.output || "",
+          });
+        }
+      });
+    }
+
     function renderProblem(payload) {
       activeId = payload.problemId;
 
-      if (hideMeta) {
-        activeUrl = null;
-        openBtn.disabled = true;
-      } else {
-        activeUrl = payload.url;
-        openBtn.disabled = false;
-      }
-
       const samples = payload.samples || [];
-      sampleSel.innerHTML = "";
-      for (let i = 0; i < samples.length; i++) {
-        const opt = document.createElement("option");
-        opt.value = String(i);
-        opt.textContent = "예제 " + (i + 1);
-        sampleSel.appendChild(opt);
-      }
-      setRunEnabled(samples.length > 0);
-
-      const samplesPreview = samples.slice(0, 2).map((s, idx) => {
-        const i = escapeHtml(s.input || "");
-        const o = escapeHtml(s.output || "");
-        return \`
-          <div class="section">
-            <h2>예제 \${idx + 1}</h2>
-            <div class="card">
-              <div style="font-weight:900;margin-bottom:6px;color:#4da3ff;">입력</div>
-              <pre>\${i}</pre>
-              <div style="font-weight:900;margin:12px 0 6px;color:#4da3ff;">출력</div>
-              <pre>\${o}</pre>
-            </div>
-          </div>
-        \`;
-      }).join("");
+      const sampleCount = samples.length;
 
       const headHtml = hideMeta
         ? \`
@@ -928,6 +1118,97 @@ function getWebviewHtml(webview: vscode.Webview) {
           <div style="font-size:16px;font-weight:900;margin:0 0 8px;">\${escapeHtml(payload.title)}</div>
           <div class="muted" style="margin-bottom:16px;">BOJ \${payload.problemId}</div>
         \`;
+
+      const samplesTop = (samples.length || customCases.length)
+        ? \`
+          <div class="section">
+            <div class="sampleHead">
+              <h2 style="margin:0;">전체 실행</h2>
+              <button class="iconBtn runBtn" id="runAllInline" \${examFinished ? "disabled" : ""} title="전체 Run">▶</button>
+            </div>
+          </div>
+        \`
+        : "";
+
+      const samplesHtml = (samples || []).map((s, idx) => {
+        const i = escapeHtml(s.input || "");
+        const o = escapeHtml(s.output || "");
+        const no = idx + 1;
+        return \`
+          <div class="section" id="ex-\${no}">
+            <div class="sampleHead">
+              <h2 style="margin:0;">예제 \${no}</h2>
+              <button class="iconBtn runBtn" data-run="example" data-kind="sample" data-idx="\${idx}" \${examFinished ? "disabled" : ""} title="예제 Run">▶</button>
+            </div>
+            <div class="card">
+              <div class="grid2">
+                <div>
+                  <div style="font-weight:900;margin-bottom:6px;">입력</div>
+                  <pre>\${i}</pre>
+                </div>
+                <div>
+                  <div style="font-weight:900;margin-bottom:6px;">출력</div>
+                  <pre>\${o}</pre>
+                </div>
+              </div>
+            </div>
+          </div>
+        \`;
+      }).join("");
+
+      const customHtml = (customCases || []).map((c, idx) => {
+        const no = sampleCount + idx + 1;
+        const i = escapeHtml(c.input || "");
+        const hasOut = (c.output || "").trim().length > 0;
+        const o = escapeHtml(c.output || "");
+
+        const outBlock = hasOut
+          ? \`<pre>\${o}</pre>\`
+          : \`<pre class="muted">(출력 미입력)</pre>\`;
+
+        return \`
+          <div class="section" id="ex-\${no}">
+            <div class="sampleHead">
+              <h2 style="margin:0;">예제 \${no}</h2>
+              <button class="iconBtn runBtn" data-run="example" data-kind="custom" data-idx="\${idx}" \${examFinished ? "disabled" : ""} title="예제 Run">▶</button>
+              <button class="btn secondary" data-del="custom" data-idx="\${idx}" \${examFinished ? "disabled" : ""} style="margin-left:8px;">삭제</button>
+            </div>
+            <div class="card">
+              <div class="grid2">
+                <div>
+                  <div style="font-weight:900;margin-bottom:6px;">입력</div>
+                  <pre>\${i}</pre>
+                </div>
+                <div>
+                  <div style="font-weight:900;margin-bottom:6px;">출력</div>
+                  \${outBlock}
+                </div>
+              </div>
+            </div>
+          </div>
+        \`;
+      }).join("");
+
+      const addBox = \`
+        <div class="section">
+          <div class="card">
+            <div style="font-weight:900;margin-bottom:10px;color:#4da3ff;">예제 추가</div>
+            <div class="grid2">
+              <div>
+                <div style="font-weight:900;margin-bottom:6px;">입력</div>
+                <textarea id="tcInput" placeholder="입력을 붙여넣어주세요" \${examFinished ? "disabled" : ""}></textarea>
+              </div>
+              <div>
+                <div style="font-weight:900;margin-bottom:6px;">출력 (선택)</div>
+                <textarea id="tcOutput" placeholder="기대 출력을 입력하면 PASS/FAIL로 채점합니다" \${examFinished ? "disabled" : ""}></textarea>
+              </div>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
+              <button id="addTcBtn" class="btn" \${examFinished ? "disabled" : ""}>추가</button>
+            </div>
+          </div>
+        </div>
+      \`;
 
       contentEl.innerHTML = \`
         \${headHtml}
@@ -947,18 +1228,56 @@ function getWebviewHtml(webview: vscode.Webview) {
           <div class="card">\${payload.outputHtml}</div>
         </div>
 
-        \${samplesPreview}
+        \${samplesTop}
+        \${samplesHtml}
+        \${customHtml}
+        \${addBox}
       \`;
 
+      // 삭제/추가 핸들러
+      const addBtn = document.getElementById("addTcBtn");
+      if (addBtn) {
+        addBtn.addEventListener("click", () => {
+          if (!activeId) return;
+          if (examFinished) return;
+
+          const inpEl = document.getElementById("tcInput");
+          const outEl = document.getElementById("tcOutput");
+          const inp = (inpEl && inpEl.value) ? inpEl.value : "";
+          const out = (outEl && outEl.value) ? outEl.value : "";
+
+          if (!inp.trim()) return;
+
+          customCases.push({ id: genId(), input: inp, output: out });
+          if (inpEl) inpEl.value = "";
+          if (outEl) outEl.value = "";
+          renderProblem(payload);
+        });
+      }
+
+      contentEl.addEventListener("click", (ev) => {
+        const t = ev.target;
+        if (!t) return;
+
+        const del = t.closest && t.closest("button[data-del='custom']");
+        if (!del) return;
+        if (examFinished) return;
+
+        const idx = Number(del.dataset.idx || "0");
+        if (Number.isNaN(idx)) return;
+
+        customCases.splice(idx, 1);
+        renderProblem(payload);
+      });
+
+      attachExampleRunHandlers(sampleCount);
       renderList();
     }
 
     function renderFinish(links) {
       examFinished = true;
-      setRunEnabled(false);
-      openBtn.disabled = true;
-      activeUrl = null;
-
+      const runSection = document.getElementById("runSection");
+      if (runSection) runSection.style.display = "none";
       const rows = (links || []).map((x) => {
         const label = escapeHtml(x.label || "문제");
         const submitUrl = escapeHtml(x.submitUrl || "");
@@ -994,7 +1313,7 @@ function getWebviewHtml(webview: vscode.Webview) {
       if (msg.type === "init") {
         problems = msg.problems || [];
         hideMeta = !!msg.hideMeta;
-        activeId = null;
+        activeId = msg.activeProblemId || (problems[0] ? problems[0].problemId : null);
         renderList();
         return;
       }
@@ -1010,13 +1329,15 @@ function getWebviewHtml(webview: vscode.Webview) {
       }
 
       if (msg.type === "runOutput") {
-        runHint.textContent = msg.summaryText || "";
         runHost.innerHTML = msg.html || "";
-        return;
-      }
 
-      if (msg.type === "runDone") {
-        if (runHint.textContent === "실행 중...") runHint.textContent = "";
+        // 전체 실행이면 "예제 1 결과"로 스크롤
+        if (msg.mode === "all") {
+          const el = document.getElementById("rr-1");
+          if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+        } else {
+          scrollToRunResult(); // 기존: 실행 결과 섹션으로
+        }
         return;
       }
 
@@ -1064,6 +1385,7 @@ async function applyHandCodingMode(enabled: boolean) {
 
 export async function activate(context: vscode.ExtensionContext) {
   console.log("boj-mock-test activated");
+
   const langSpecs = buildLangSpecs();
   const problemCache = new Map<number, ProblemPagePayload>();
 
@@ -1074,18 +1396,24 @@ export async function activate(context: vscode.ExtensionContext) {
   let pidToWorkDir = new Map<number, vscode.Uri>();
   let isRandomModeGlobal = false;
 
+  const viewProvider = new BojMockTestViewProvider(context);
+  console.log("registered view provider:", BojMockTestViewProvider.viewType);
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider(BojMockTestViewProvider.viewType, viewProvider));
+
   const toggleHandCoding = vscode.commands.registerCommand("boj-mock-test.toggleHandCoding", async () => {
     const current = context.globalState.get<boolean>(HAND_CODING_KEY, false);
 
     if (current) {
       await applyHandCodingMode(false);
       await context.globalState.update(HAND_CODING_KEY, false);
+      viewProvider.postHandCodingState(false);
       vscode.window.showInformationMessage("손코딩 모드 OFF");
       return;
     }
 
     await applyHandCodingMode(true);
     await context.globalState.update(HAND_CODING_KEY, true);
+    viewProvider.postHandCodingState(true);
     vscode.window.showInformationMessage("손코딩 모드 ON");
   });
   context.subscriptions.push(toggleHandCoding);
@@ -1112,6 +1440,43 @@ export async function activate(context: vscode.ExtensionContext) {
   function problemFolderUriRandom(root: vscode.Uri, idx1: number) {
     const name = safeFilename(`random_${idx1}_${randToken(8)}`).slice(0, 80);
     return vscode.Uri.joinPath(root, name);
+  }
+
+  async function pickValidByFetching(
+    candidates: PickedProblem[],
+    need: number,
+    opts?: { requireSamples?: boolean; maxTryMultiplier?: number }
+  ): Promise<PickedProblem[]> {
+    const requireSamples = opts?.requireSamples ?? false;
+    const maxTry = Math.max(need, 1) * (opts?.maxTryMultiplier ?? 30);
+
+    const pool = shuffle(candidates);
+    const picked: PickedProblem[] = [];
+
+    for (let i = 0; i < pool.length && picked.length < need && i < maxTry; i++) {
+      const c = pool[i];
+
+      try {
+        const payload = await fetchProblemPage(c.problemId);
+
+        // 캐시도 같이 채워두면 이후 화면 표시가 빨라집니다.
+        // (문제 수가 많으면 메모리/요청량은 늘어납니다.)
+        // problemCache는 activate 스코프에 있으니 여기서 접근 가능해야 합니다.
+        // -> 함수가 activate 내부에 있으면 그대로 접근 가능합니다.
+        problemCache.set(c.problemId, payload);
+
+        if (requireSamples && (!payload.samples || payload.samples.length === 0)) {
+          continue;
+        }
+
+        picked.push({ problemId: c.problemId, title: c.title });
+      } catch {
+        // 파싱 실패/접근 제한 등은 그냥 스킵
+        continue;
+      }
+    }
+
+    return picked;
   }
 
   async function closeCurrentProblemEditorIfAny() {
@@ -1202,6 +1567,22 @@ export async function activate(context: vscode.ExtensionContext) {
         problemUrl: `https://www.acmicpc.net/problem/${pid}`,
       };
     });
+  }
+
+  async function prefetch3(picked: PickedProblem[], startIndex: number) {
+    const max = Math.min(picked.length, startIndex + 3);
+    const tasks: Array<Promise<void>> = [];
+    for (let i = startIndex; i < max; i++) {
+      const pid = picked[i].problemId;
+      if (problemCache.has(pid)) continue;
+      tasks.push(
+        (async () => {
+          const payload = await fetchProblemPage(pid);
+          problemCache.set(pid, payload);
+        })()
+      );
+    }
+    await Promise.allSettled(tasks);
   }
 
   const disposable = vscode.commands.registerCommand("boj-mock-test.pick3", async () => {
@@ -1321,7 +1702,18 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      picked = pickN(candidates, problemCount);
+      const valid = await pickValidByFetching(
+        candidates.map((x) => ({ problemId: x.problemId, title: x.title })),
+        problemCount,
+        { requireSamples: true, maxTryMultiplier: 50 }
+      );
+
+      if (valid.length < problemCount) {
+        vscode.window.showWarningMessage(`조건에 맞는 "유효한 문제"를 충분히 찾지 못했습니다. (찾음: ${valid.length}/${problemCount})`);
+        return;
+      }
+
+      picked = valid;
     }
 
     const timeStr = await vscode.window.showInputBox({
@@ -1334,6 +1726,7 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!timeStr) return;
     const minutes = Number(timeStr);
 
+    // 캐시 초기화
     problemCache.clear();
     pidToWorkDir = new Map<number, vscode.Uri>();
 
@@ -1354,11 +1747,40 @@ export async function activate(context: vscode.ExtensionContext) {
 
     panel.webview.html = getWebviewHtml(panel.webview);
 
+    // 3개 선로딩 + 캐싱, 그리고 1번 문제 바로 표시
+    async function showFirstProblemImmediately() {
+      if (!picked.length) return;
+      const firstPid = picked[0].problemId;
+
+      // 1) 최소 1번 문제는 즉시 확보
+      if (!problemCache.has(firstPid)) {
+        const payload1 = await fetchProblemPage(firstPid);
+        problemCache.set(firstPid, payload1);
+      }
+
+      // 2) 첫 3개를 추가로 프리패치 (백그라운드)
+      void prefetch3(picked, 0);
+
+      const payload = problemCache.get(firstPid);
+      if (!payload) return;
+
+      panel.webview.postMessage({ type: "problemContent", payload });
+      await openSingleEditorForProblem(firstPid, payload.title, !isRandomMode, lang);
+
+      // 3) 리스트에서 첫 문제 활성 표시
+      panel.webview.postMessage({ type: "init", problems: picked, hideMeta: isRandomMode, activeProblemId: firstPid });
+    }
+
     panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         if (msg.type === "ready") {
-          panel.webview.postMessage({ type: "init", problems: picked, hideMeta: isRandomMode });
+          const firstPid = picked[0]?.problemId ?? null;
+          panel.webview.postMessage({ type: "init", problems: picked, hideMeta: isRandomMode, activeProblemId: firstPid });
           startTimer(minutes, panel);
+
+          if (picked.length) {
+            await showFirstProblemImmediately();
+          }
           return;
         }
 
@@ -1378,31 +1800,35 @@ export async function activate(context: vscode.ExtensionContext) {
 
         if (msg.type === "selectProblem") {
           const pid = Number(msg.problemId);
-          const payload = await fetchProblemPage(pid);
+          const idx = picked.findIndex((x) => x.problemId === pid);
 
-          problemCache.set(pid, payload);
+          if (idx >= 0) {
+            await prefetch3(picked, idx);
+            void prefetch3(picked, idx + 1);
+          }
+
+          let payload = problemCache.get(pid);
+          if (!payload) {
+            payload = await fetchProblemPage(pid);
+            problemCache.set(pid, payload);
+          }
 
           panel.webview.postMessage({ type: "problemContent", payload });
           await openSingleEditorForProblem(pid, payload.title, !isRandomMode, lang);
           return;
         }
 
-        if (msg.type === "openExternal") {
-          if (isRandomMode) return;
-          const url = String(msg.url || "");
-          if (!url) return;
-          vscode.env.openExternal(vscode.Uri.parse(url));
-          return;
-        }
-
-        if (msg.type === "runSample") {
+        // 개별 샘플 Run
+        if (msg.type === "runOneSample") {
           const pid = Number(msg.problemId);
-          const mode = String(msg.mode ?? "all");
+          const idx = Number(msg.idx);
 
           const payload = problemCache.get(pid);
-          if (!payload) throw new Error("문제 데이터가 없습니다. (문제를 먼저 클릭하세요)");
+          if (!payload) throw new Error("문제 데이터가 없습니다.");
           if (!currentProblemDocUri) throw new Error("코드 파일이 열려있지 않습니다.");
           if (!currentWorkDir) throw new Error("작업 디렉터리가 없습니다.");
+
+          if (Number.isNaN(idx) || idx < 0 || idx >= payload.samples.length) throw new Error("예제 인덱스가 잘못되었습니다.");
 
           const srcPath = currentProblemDocUri.fsPath;
           const workDirPath = currentWorkDir.fsPath;
@@ -1411,43 +1837,6 @@ export async function activate(context: vscode.ExtensionContext) {
           if (doc?.isDirty) await doc.save();
 
           const timeoutMs = 2000;
-
-          if (mode === "all") {
-            let allOk = true;
-            let rows = "";
-
-            for (let i = 0; i < payload.samples.length; i++) {
-              const r = await gradeOne(lang, srcPath, workDirPath, payload.samples[i], timeoutMs);
-              if (!r.ok) allOk = false;
-              rows += runResultRow(i + 1, r.ok, r.ok ? "" : r.detail);
-            }
-
-            const summary = allOk
-              ? `<span class="badge ok"><span class="emoji">⭕</span>전체 예제 PASS</span>`
-              : `<span class="badge fail"><span class="emoji">❌</span>전체 예제 FAIL</span>`;
-
-            const html = `
-              <div>
-                <div class="rowHead">
-                  ${summary}
-                  <div class="small muted">timeout: ${timeoutMs}ms</div>
-                </div>
-                ${rows}
-              </div>
-            `;
-
-            panel.webview.postMessage({
-              type: "runOutput",
-              summaryText: allOk ? "전체 예제 PASS" : "전체 예제 FAIL",
-              html,
-            });
-            panel.webview.postMessage({ type: "runDone" });
-            return;
-          }
-
-          const idx = Number(mode);
-          if (Number.isNaN(idx) || idx < 0 || idx >= payload.samples.length) throw new Error("예제 인덱스가 잘못되었습니다.");
-
           const r = await gradeOne(lang, srcPath, workDirPath, payload.samples[idx], timeoutMs);
 
           const html = `
@@ -1462,6 +1851,120 @@ export async function activate(context: vscode.ExtensionContext) {
             html,
           });
           panel.webview.postMessage({ type: "runDone" });
+          return;
+        }
+
+        // 개별 커스텀 Run (번호는 webview에서 계산해 보내줌)
+        if (msg.type === "runOneCustom") {
+          const pid = Number(msg.problemId);
+          const exampleNo = Number(msg.exampleNo);
+          const input = String(msg.input ?? "");
+          const expected = String(msg.expected ?? "");
+
+          if (!problemCache.has(pid)) throw new Error("문제 데이터가 없습니다.");
+          if (!currentProblemDocUri) throw new Error("코드 파일이 열려있지 않습니다.");
+          if (!currentWorkDir) throw new Error("작업 디렉터리가 없습니다.");
+
+          const srcPath = currentProblemDocUri.fsPath;
+          const workDirPath = currentWorkDir.fsPath;
+
+          const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === currentProblemDocUri!.toString());
+          if (doc?.isDirty) await doc.save();
+
+          const timeoutMs = 2000;
+
+          if (expected && expected.trim()) {
+            const r = await gradeOne(lang, srcPath, workDirPath, { input, output: expected }, timeoutMs);
+            const html = `
+              <div>
+                ${runResultRow(exampleNo, r.ok, r.ok ? "" : r.detail)}
+              </div>
+            `;
+            panel.webview.postMessage({
+              type: "runOutput",
+              summaryText: r.ok ? `예제 ${exampleNo} PASS` : `예제 ${exampleNo} FAIL`,
+              html,
+            });
+            panel.webview.postMessage({ type: "runDone" });
+            return;
+          }
+
+          const r2 = await runOnly(lang, srcPath, workDirPath, input, timeoutMs);
+          const html2 = `
+            <div>
+              ${runCustomRow(`예제 ${exampleNo}`, r2.ok, r2.detail)}
+            </div>
+          `;
+          panel.webview.postMessage({
+            type: "runOutput",
+            summaryText: r2.ok ? `예제 ${exampleNo} 실행 완료` : `예제 ${exampleNo} 실행 실패`,
+            html: html2,
+          });
+          panel.webview.postMessage({ type: "runDone" });
+          return;
+        }
+
+        // 전체 Run (샘플 + 커스텀)
+        if (msg.type === "runAll") {
+          const pid = Number(msg.problemId);
+          const custom = Array.isArray(msg.cases) ? msg.cases : [];
+
+          const payload = problemCache.get(pid);
+          if (!payload) throw new Error("문제 데이터가 없습니다.");
+          if (!currentProblemDocUri) throw new Error("코드 파일이 열려있지 않습니다.");
+          if (!currentWorkDir) throw new Error("작업 디렉터리가 없습니다.");
+
+          const srcPath = currentProblemDocUri.fsPath;
+          const workDirPath = currentWorkDir.fsPath;
+
+          const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === currentProblemDocUri!.toString());
+          if (doc?.isDirty) await doc.save();
+
+          const timeoutMs = 2000;
+
+          let allOk = true;
+          let rows = "";
+
+          // 1) BOJ 샘플
+          for (let i = 0; i < payload.samples.length; i++) {
+            const r = await gradeOne(lang, srcPath, workDirPath, payload.samples[i], timeoutMs);
+            if (!r.ok) allOk = false;
+            rows += runResultRow(i + 1, r.ok, r.ok ? "" : r.detail);
+          }
+
+          // 2) 커스텀 (번호 이어붙이기)
+          const base = payload.samples.length;
+          for (let j = 0; j < custom.length; j++) {
+            const exampleNo = base + j + 1;
+            const input = String(custom[j]?.input ?? "");
+            const expected = String(custom[j]?.output ?? "");
+
+            if (expected && expected.trim()) {
+              const r = await gradeOne(lang, srcPath, workDirPath, { input, output: expected }, timeoutMs);
+              if (!r.ok) allOk = false;
+              rows += runResultRow(exampleNo, r.ok, r.ok ? "" : r.detail);
+              continue;
+            }
+
+            const r2 = await runOnly(lang, srcPath, workDirPath, input, timeoutMs);
+            if (!r2.ok) allOk = false;
+            rows += runCustomRow(`예제 ${exampleNo}`, r2.ok, r2.detail);
+          }
+
+          const html = `
+            <div>
+              ${rows}
+            </div>
+          `;
+
+          panel.webview.postMessage({
+            type: "runOutput",
+            summaryText: "",
+            html,
+            mode: "all",
+          });
+          panel.webview.postMessage({ type: "runDone" });
+          return;
         }
       } catch (e) {
         const m = e instanceof Error ? e.message : String(e);
@@ -1471,12 +1974,6 @@ export async function activate(context: vscode.ExtensionContext) {
   });
 
   context.subscriptions.push(disposable);
-  const viewProvider = new BojMockTestViewProvider(context);
-  console.log("registered view provider:", BojMockTestViewProvider.viewType);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(BojMockTestViewProvider.viewType, viewProvider)
-  );
-
 }
 
 export function deactivate() {}
