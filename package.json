@@ -3,13 +3,18 @@
   "publisher": "gmyun1999",
   "displayName": "boj-mock-test",
   "description": "Pick random Baekjoon problems for mock coding tests",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "engines": {
     "vscode": "^1.107.0"
   },
   "categories": [
     "Other"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/4jades/boj-mock-test.git"
+  },
+  "homepage": "https://github.com/4jades/boj-mock-test#readme",
   "activationEvents": [
     "onStartupFinished",
     "onCommand:boj-mock-test.pick3",
