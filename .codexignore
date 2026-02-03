@@ -1,0 +1,20 @@
+node_modules/
+dist/
+build/
+
+# 가상환경
+.venv/
+venv/
+
+# 로그 / 캐시
+*.log
+.cache/
+
+# 비밀 정보
+.env
+.env.*
+*.key
+*.pem
+
+# 테스트 산출물
+coverage/

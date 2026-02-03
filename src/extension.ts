@@ -633,10 +633,19 @@ function esc(s: string) {
     .replaceAll(">", "&gt;");
 }
 
-function runResultRow(idx: number, ok: boolean, detail: string) {
+function runResultRow(
+  idx: number,
+  ok: boolean,
+  detail: string,
+  rerun?: { kind: "sample" | "custom"; idx: number }
+) {
   const badge = ok
     ? `<span class="badge ok"><span class="emoji">✅</span>PASS</span>`
     : `<span class="badge fail"><span class="emoji">❌</span>FAIL</span>`;
+
+  const rerunBtn = rerun
+    ? `<button class="iconBtn runBtn" data-run="rerun" data-kind="${rerun.kind}" data-idx="${rerun.idx}" title="다시 실행">▶</button>`
+    : "";
 
   let detailHtml = "";
   if (detail) {
@@ -674,6 +683,7 @@ function runResultRow(idx: number, ok: boolean, detail: string) {
       <div class="rowHead">
         <div class="mono"><b>예제 ${idx}</b></div>
         ${badge}
+        ${rerunBtn}
       </div>
       ${detailHtml}
     </div>
@@ -681,10 +691,19 @@ function runResultRow(idx: number, ok: boolean, detail: string) {
 }
 
 
-function runCustomRow(label: string, ok: boolean, detail: string) {
+function runCustomRow(
+  label: string,
+  ok: boolean,
+  detail: string,
+  rerun?: { kind: "sample" | "custom"; idx: number }
+) {
   const badge = ok
     ? `<span class="badge ok"><span class="emoji">⭕</span>PASS</span>`
     : `<span class="badge fail"><span class="emoji">❌</span>FAIL</span>`;
+
+  const rerunBtn = rerun
+    ? `<button class="iconBtn runBtn" data-run="rerun" data-kind="${rerun.kind}" data-idx="${rerun.idx}" title="다시 실행">▶</button>`
+    : "";
 
   const detailHtml = detail ? `<pre class="mono">${esc(detail)}</pre>` : "";
   return `
@@ -692,6 +711,7 @@ function runCustomRow(label: string, ok: boolean, detail: string) {
       <div class="rowHead">
         <div class="mono"><b>${esc(label)}</b></div>
         ${badge}
+        ${rerunBtn}
       </div>
       ${detailHtml}
     </div>
@@ -975,9 +995,20 @@ function getWebviewHtml(webview: vscode.Webview) {
     let activeId = null;
     let hideMeta = false;
     let examFinished = false;
+    let currentSampleCount = 0;
 
-    // { id, input, output }
+    // 문제별 커스텀 예제 저장
+    // { [problemId]: Array<{ id, input, output }> }
+    const customCasesByPid = new Map();
     let customCases = [];
+
+    function ensureCustomCases(problemId) {
+      if (!problemId) return [];
+      if (!customCasesByPid.has(problemId)) {
+        customCasesByPid.set(problemId, []);
+      }
+      return customCasesByPid.get(problemId) || [];
+    }
 
     const listEl = document.getElementById("list");
     const contentEl = document.getElementById("content");
@@ -1096,6 +1127,7 @@ function getWebviewHtml(webview: vscode.Webview) {
             type: "runOneCustom",
             problemId: activeId,
             exampleNo,
+            customIdx: idx,
             input: c.input || "",
             expected: c.output || "",
           });
@@ -1106,8 +1138,11 @@ function getWebviewHtml(webview: vscode.Webview) {
     function renderProblem(payload) {
       activeId = payload.problemId;
 
+      customCases = ensureCustomCases(activeId);
+
       const samples = payload.samples || [];
       const sampleCount = samples.length;
+      currentSampleCount = sampleCount;
 
       const headHtml = hideMeta
         ? \`
@@ -1351,6 +1386,42 @@ function getWebviewHtml(webview: vscode.Webview) {
         return;
       }
     });
+
+    // 실행 결과 영역에서 재실행 버튼 처리
+    if (runHost) {
+      runHost.addEventListener("click", (ev) => {
+        const t = ev.target;
+        if (!t) return;
+
+        const btn = t.closest && t.closest("button[data-run='rerun']");
+        if (!btn) return;
+        if (!activeId) return;
+        if (examFinished) return;
+
+        const kind = String(btn.dataset.kind || "sample");
+        const idx = Number(btn.dataset.idx || "0");
+        if (Number.isNaN(idx)) return;
+
+        if (kind === "sample") {
+          vscode.postMessage({ type: "runOneSample", problemId: activeId, idx });
+          return;
+        }
+
+        if (kind === "custom") {
+          const c = customCases[idx];
+          if (!c) return;
+          const exampleNo = currentSampleCount + idx + 1;
+          vscode.postMessage({
+            type: "runOneCustom",
+            problemId: activeId,
+            exampleNo,
+            customIdx: idx,
+            input: c.input || "",
+            expected: c.output || "",
+          });
+        }
+      });
+    }
 
     vscode.postMessage({ type: "ready" });
   </script>
@@ -1841,7 +1912,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
           const html = `
             <div>
-              ${runResultRow(idx + 1, r.ok, r.ok ? "" : r.detail)}
+              ${runResultRow(idx + 1, r.ok, r.ok ? "" : r.detail, { kind: "sample", idx })}
             </div>
           `;
 
@@ -1858,6 +1929,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (msg.type === "runOneCustom") {
           const pid = Number(msg.problemId);
           const exampleNo = Number(msg.exampleNo);
+          const customIdx = Number(msg.customIdx);
           const input = String(msg.input ?? "");
           const expected = String(msg.expected ?? "");
 
@@ -1875,9 +1947,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
           if (expected && expected.trim()) {
             const r = await gradeOne(lang, srcPath, workDirPath, { input, output: expected }, timeoutMs);
+            const rerun = Number.isNaN(customIdx) ? undefined : { kind: "custom" as const, idx: customIdx };
             const html = `
               <div>
-                ${runResultRow(exampleNo, r.ok, r.ok ? "" : r.detail)}
+                ${runResultRow(exampleNo, r.ok, r.ok ? "" : r.detail, rerun)}
               </div>
             `;
             panel.webview.postMessage({
@@ -1890,9 +1963,10 @@ export async function activate(context: vscode.ExtensionContext) {
           }
 
           const r2 = await runOnly(lang, srcPath, workDirPath, input, timeoutMs);
+          const rerun2 = Number.isNaN(customIdx) ? undefined : { kind: "custom" as const, idx: customIdx };
           const html2 = `
             <div>
-              ${runCustomRow(`예제 ${exampleNo}`, r2.ok, r2.detail)}
+              ${runCustomRow(`예제 ${exampleNo}`, r2.ok, r2.detail, rerun2)}
             </div>
           `;
           panel.webview.postMessage({
@@ -1929,7 +2003,7 @@ export async function activate(context: vscode.ExtensionContext) {
           for (let i = 0; i < payload.samples.length; i++) {
             const r = await gradeOne(lang, srcPath, workDirPath, payload.samples[i], timeoutMs);
             if (!r.ok) allOk = false;
-            rows += runResultRow(i + 1, r.ok, r.ok ? "" : r.detail);
+            rows += runResultRow(i + 1, r.ok, r.ok ? "" : r.detail, { kind: "sample", idx: i });
           }
 
           // 2) 커스텀 (번호 이어붙이기)
@@ -1942,13 +2016,13 @@ export async function activate(context: vscode.ExtensionContext) {
             if (expected && expected.trim()) {
               const r = await gradeOne(lang, srcPath, workDirPath, { input, output: expected }, timeoutMs);
               if (!r.ok) allOk = false;
-              rows += runResultRow(exampleNo, r.ok, r.ok ? "" : r.detail);
+              rows += runResultRow(exampleNo, r.ok, r.ok ? "" : r.detail, { kind: "custom", idx: j });
               continue;
             }
 
             const r2 = await runOnly(lang, srcPath, workDirPath, input, timeoutMs);
             if (!r2.ok) allOk = false;
-            rows += runCustomRow(`예제 ${exampleNo}`, r2.ok, r2.detail);
+            rows += runCustomRow(`예제 ${exampleNo}`, r2.ok, r2.detail, { kind: "custom", idx: j });
           }
 
           const html = `
