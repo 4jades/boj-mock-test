@@ -3,7 +3,7 @@
   "publisher": "gmyun1999",
   "displayName": "boj-mock-test",
   "description": "Pick random Baekjoon problems for mock coding tests",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.107.0"
