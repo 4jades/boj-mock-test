@@ -44,7 +44,16 @@ type LangSpec = {
   run: (srcPath: string, workDir: string, compiledOutPath?: string) => { cmd: string; args: string[] };
 };
 
+type SharedPayload = {
+  v: 1;
+  problemIds: number[];
+  minutes: number;
+  hideMeta: boolean;
+};
+
 const HAND_CODING_KEY = "bojMockTest.handCodingMode";
+const SHARED_CODE_PREFIX = "BMT1";
+const SHARED_CODE_KEY = "boj-mock-test::v1";
 
 /**
  * Sidebar View (Activity Bar / Side Bar WebviewView)
@@ -192,8 +201,9 @@ function pickN<T>(arr: T[], n: number): T[] {
   return shuffle(arr).slice(0, n);
 }
 
-async function fetchCandidates(handle: string, minTier: string, maxTier: string): Promise<PickedProblem[]> {
-  const query = `*${minTier}..${maxTier} s#5000.. -@${handle}`;
+async function fetchCandidates(handles: string[], minTier: string, maxTier: string): Promise<PickedProblem[]> {
+  const excludes = handles.map((h) => `-@${h}`).join(" ");
+  const query = `*${minTier}..${maxTier} s#5000.. ${excludes}`.trim();
   const url = new URL("https://solved.ac/api/v3/search/problem");
   url.searchParams.set("query", query);
   url.searchParams.set("page", "1");
@@ -298,6 +308,58 @@ function safeFilename(s: string) {
 function randToken(len: number) {
   const s = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   return s.slice(0, len);
+}
+
+function xorText(text: string, key: string) {
+  if (!key) return text;
+  const out = new Array(text.length);
+  for (let i = 0; i < text.length; i++) {
+    out[i] = String.fromCharCode(text.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+  }
+  return out.join("");
+}
+
+function toBase64Url(buf: Buffer) {
+  return buf
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function fromBase64Url(s: string) {
+  const base = s.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = base.length % 4 === 0 ? "" : "=".repeat(4 - (base.length % 4));
+  return Buffer.from(base + pad, "base64");
+}
+
+function encodeSharedCode(payload: SharedPayload) {
+  const json = JSON.stringify(payload);
+  const xored = xorText(json, SHARED_CODE_KEY);
+  const body = toBase64Url(Buffer.from(xored, "utf8"));
+  return `${SHARED_CODE_PREFIX}_${body}`;
+}
+
+function decodeSharedCode(code: string): SharedPayload | null {
+  const raw = code.trim();
+  const body = raw.startsWith(`${SHARED_CODE_PREFIX}_`) ? raw.slice(SHARED_CODE_PREFIX.length + 1) : raw;
+  if (!body) return null;
+
+  try {
+    const buf = fromBase64Url(body);
+    const xored = buf.toString("utf8");
+    const json = xorText(xored, SHARED_CODE_KEY);
+    const parsed = JSON.parse(json) as SharedPayload;
+
+    if (parsed?.v !== 1) return null;
+    if (!Array.isArray(parsed.problemIds) || parsed.problemIds.some((x) => typeof x !== "number" || !Number.isFinite(x))) return null;
+    if (typeof parsed.minutes !== "number" || !Number.isFinite(parsed.minutes) || parsed.minutes <= 0) return null;
+    if (typeof parsed.hideMeta !== "boolean") return null;
+
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 function sessionIdNow() {
@@ -1513,6 +1575,46 @@ export async function activate(context: vscode.ExtensionContext) {
     return vscode.Uri.joinPath(root, name);
   }
 
+  async function askHandlesList(prompt: string): Promise<string[] | null> {
+    const raw = await vscode.window.showInputBox({
+      prompt,
+      placeHolder: "예: gildong123, hong123",
+      ignoreFocusOut: true,
+      validateInput: (v) => {
+        const list = v
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean);
+        if (list.length === 0) return "핸들을 1개 이상 입력하세요.";
+        return null;
+      },
+    });
+
+    if (!raw) return null;
+    const handles = raw
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    const unique = Array.from(new Set(handles));
+    return unique.length ? unique : null;
+  }
+
+  async function pickLanguage(): Promise<LangSpec | null> {
+    const langPick = await vscode.window.showQuickPick(
+      [
+        { label: "Python", value: "py" as const },
+        { label: "JavaScript", value: "js" as const },
+        { label: "Kotlin", value: "kt" as const },
+        { label: "Java", value: "java" as const },
+        { label: "C++", value: "cpp" as const },
+        { label: "C", value: "c" as const },
+      ],
+      { placeHolder: "풀이 언어 선택" }
+    );
+    if (!langPick) return null;
+    return langSpecs[langPick.value];
+  }
+
   async function pickValidByFetching(
     candidates: PickedProblem[],
     need: number,
@@ -1656,146 +1758,8 @@ export async function activate(context: vscode.ExtensionContext) {
     await Promise.allSettled(tasks);
   }
 
-  const disposable = vscode.commands.registerCommand("boj-mock-test.pick3", async () => {
-    const langPick = await vscode.window.showQuickPick(
-      [
-        { label: "Python", value: "py" as const },
-        { label: "JavaScript", value: "js" as const },
-        { label: "Kotlin", value: "kt" as const },
-        { label: "Java", value: "java" as const },
-        { label: "C++", value: "cpp" as const },
-        { label: "C", value: "c" as const },
-      ],
-      { placeHolder: "풀이 언어 선택" }
-    );
-    if (!langPick) return;
-
-    const lang = langSpecs[langPick.value];
-
-    const mode = await vscode.window.showQuickPick(
-      [
-        { label: "랜덤 문제", value: "random" as const },
-        { label: "문제 번호 직접 입력", value: "manual" as const },
-      ],
-      { placeHolder: "모드 선택" }
-    );
-    if (!mode) return;
-
-    const countStr = await vscode.window.showInputBox({
-      prompt: "문제 개수",
-      value: "3",
-      ignoreFocusOut: true,
-      validateInput: (v) => {
-        if (!/^\d+$/.test(v.trim())) return "숫자를 입력하세요.";
-        const n = Number(v);
-        if (n <= 0) return "1 이상이어야 합니다.";
-        if (n > 10) return "최대 10문제까지 가능합니다.";
-        return null;
-      },
-    });
-    if (!countStr) return;
-
-    const problemCount = Number(countStr);
-
-    const isRandomMode = mode.value === "random";
-    isRandomModeGlobal = isRandomMode;
-
-    let picked: PickedProblem[] = [];
-
-    if (mode.value === "manual") {
-      const idsStr = await vscode.window.showInputBox({
-        prompt: `문제 번호 ${problemCount}개 (예: 1000, 2557, ...)`,
-        ignoreFocusOut: true,
-        validateInput: (v) => {
-          const ids = v.split(/[,\s]+/).filter(Boolean);
-          if (ids.length !== problemCount) return `문제 번호 ${problemCount}개를 입력하세요.`;
-          if (!ids.every((x) => /^\d+$/.test(x))) return "숫자만 입력하세요.";
-          return null;
-        },
-      });
-      if (!idsStr) return;
-
-      const ids = idsStr
-        .split(/[,\s]+/)
-        .filter(Boolean)
-        .map((x) => Number(x));
-
-      picked = ids.map((id) => ({ problemId: id, title: `BOJ ${id}` }));
-    } else {
-      const handle = await vscode.window.showInputBox({
-        prompt: "사용자의 백준 ID를 입력해주세요 (사용자가 이미 푼 문제는 제외하기 위함)",
-        placeHolder: "예: gildong123",
-        ignoreFocusOut: true,
-      });
-
-      if (!handle) return;
-
-      const tierPick = await vscode.window.showQuickPick(
-        [
-          { label: "Bronze 1 ~ Gold 4", min: "b1", max: "g4" },
-          { label: "Bronze 1 ~ Silver 1", min: "b1", max: "s1" },
-          { label: "Silver 5 ~ Gold 4", min: "s5", max: "g4" },
-          { label: "Gold 5 ~ Gold 4", min: "g5", max: "g4" },
-          { label: "직접 입력", min: "", max: "" },
-        ],
-        { placeHolder: "난이도 범위 선택" }
-      );
-
-      if (!tierPick) return;
-
-      let minTier = tierPick.min;
-      let maxTier = tierPick.max;
-
-      if (tierPick.label === "직접 입력") {
-        const minStr = (await vscode.window.showInputBox({
-          prompt: "min tier 입력 (예: b1, s5, g3, p2)",
-          ignoreFocusOut: true,
-          validateInput: (v) => (/^[bsgp][1-5]$/i.test(v.trim()) ? null : "예: b1, s5, g3, p2 형태로 입력하세요."),
-        }))?.trim().toLowerCase();
-
-        if (!minStr) return;
-
-        const maxStr = (await vscode.window.showInputBox({
-          prompt: "max tier 입력 (예: g4)",
-          ignoreFocusOut: true,
-          validateInput: (v) => (/^[bsgp][1-5]$/i.test(v.trim()) ? null : "예: b1, s5, g3, p2 형태로 입력하세요."),
-        }))?.trim().toLowerCase();
-
-        if (!maxStr) return;
-
-        minTier = minStr;
-        maxTier = maxStr;
-      }
-
-      const candidates = await fetchCandidates(handle, minTier, maxTier);
-      if (candidates.length < problemCount) {
-        vscode.window.showWarningMessage(`조건에 맞는 문제가 ${problemCount}개 미만입니다.`);
-        return;
-      }
-
-      const valid = await pickValidByFetching(
-        candidates.map((x) => ({ problemId: x.problemId, title: x.title })),
-        problemCount,
-        { requireSamples: true, maxTryMultiplier: 50 }
-      );
-
-      if (valid.length < problemCount) {
-        vscode.window.showWarningMessage(`조건에 맞는 "유효한 문제"를 충분히 찾지 못했습니다. (찾음: ${valid.length}/${problemCount})`);
-        return;
-      }
-
-      picked = valid;
-    }
-
-    const timeStr = await vscode.window.showInputBox({
-      prompt: "시험 시간(분)",
-      value: "90",
-      ignoreFocusOut: true,
-      validateInput: (v) => (/^\d+$/.test(v.trim()) ? null : "숫자(분)만 입력하세요."),
-    });
-
-    if (!timeStr) return;
-    const minutes = Number(timeStr);
+  async function startSession(picked: PickedProblem[], minutes: number, hideMeta: boolean, lang: LangSpec) {
+    isRandomModeGlobal = hideMeta;
 
     // 캐시 초기화
     problemCache.clear();
@@ -1805,7 +1769,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     for (let i = 0; i < picked.length; i++) {
       const p = picked[i];
-      const folderUri = isRandomMode ? problemFolderUriRandom(root, i + 1) : problemFolderUriManual(root, p.problemId, p.title, lang.id);
+      const folderUri = hideMeta ? problemFolderUriRandom(root, i + 1) : problemFolderUriManual(root, p.problemId, p.title, lang.id);
 
       pidToWorkDir.set(p.problemId, folderUri);
       await vscode.workspace.fs.createDirectory(folderUri);
@@ -1836,17 +1800,17 @@ export async function activate(context: vscode.ExtensionContext) {
       if (!payload) return;
 
       panel.webview.postMessage({ type: "problemContent", payload });
-      await openSingleEditorForProblem(firstPid, payload.title, !isRandomMode, lang);
+      await openSingleEditorForProblem(firstPid, payload.title, !hideMeta, lang);
 
       // 3) 리스트에서 첫 문제 활성 표시
-      panel.webview.postMessage({ type: "init", problems: picked, hideMeta: isRandomMode, activeProblemId: firstPid });
+      panel.webview.postMessage({ type: "init", problems: picked, hideMeta, activeProblemId: firstPid });
     }
 
     panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         if (msg.type === "ready") {
           const firstPid = picked[0]?.problemId ?? null;
-          panel.webview.postMessage({ type: "init", problems: picked, hideMeta: isRandomMode, activeProblemId: firstPid });
+          panel.webview.postMessage({ type: "init", problems: picked, hideMeta, activeProblemId: firstPid });
           startTimer(minutes, panel);
 
           if (picked.length) {
@@ -1885,7 +1849,7 @@ export async function activate(context: vscode.ExtensionContext) {
           }
 
           panel.webview.postMessage({ type: "problemContent", payload });
-          await openSingleEditorForProblem(pid, payload.title, !isRandomMode, lang);
+          await openSingleEditorForProblem(pid, payload.title, !hideMeta, lang);
           return;
         }
 
@@ -2045,6 +2009,274 @@ export async function activate(context: vscode.ExtensionContext) {
         panel.webview.postMessage({ type: "error", message: m });
       }
     });
+  }
+
+  const disposable = vscode.commands.registerCommand("boj-mock-test.pick3", async () => {
+    const sessionPick = await vscode.window.showQuickPick(
+      [
+        { label: "혼자 풀기", value: "solo" as const },
+        { label: "여러명 같이 풀기", value: "group" as const },
+      ],
+      { placeHolder: "모의 테스트 방식 선택" }
+    );
+    if (!sessionPick) return;
+
+    let picked: PickedProblem[] = [];
+    let minutes = 0;
+    let hideMeta = false;
+
+    if (sessionPick.value === "group") {
+      const groupPick = await vscode.window.showQuickPick(
+        [
+          { label: "입장 코드 생성", value: "create" as const },
+          { label: "입장 코드 입력", value: "join" as const },
+        ],
+        { placeHolder: "공동 세션 선택" }
+      );
+      if (!groupPick) return;
+
+      if (groupPick.value === "join") {
+        const code = await vscode.window.showInputBox({
+          prompt: "입장 코드를 입력하세요",
+          ignoreFocusOut: true,
+        });
+        if (!code) return;
+
+        const payload = decodeSharedCode(code);
+        if (!payload || payload.problemIds.length === 0) {
+          vscode.window.showErrorMessage("입장 코드가 올바르지 않습니다.");
+          return;
+        }
+
+        picked = payload.problemIds.map((id) => ({ problemId: id, title: `BOJ ${id}` }));
+        minutes = payload.minutes;
+        hideMeta = payload.hideMeta;
+      } else {
+        const countStr = await vscode.window.showInputBox({
+          prompt: "문제 개수",
+          value: "3",
+          ignoreFocusOut: true,
+          validateInput: (v) => {
+            if (!/^\d+$/.test(v.trim())) return "숫자를 입력하세요.";
+            const n = Number(v);
+            if (n <= 0) return "1 이상이어야 합니다.";
+            if (n > 10) return "최대 10문제까지 가능합니다.";
+            return null;
+          },
+        });
+        if (!countStr) return;
+
+        const problemCount = Number(countStr);
+        const handles = await askHandlesList("참여자 백준 아이디(여러명의 경우 콤마 구분) 입력");
+        if (!handles) return;
+
+        const tierPick = await vscode.window.showQuickPick(
+          [
+            { label: "Bronze 1 ~ Gold 4", min: "b1", max: "g4" },
+            { label: "Bronze 1 ~ Silver 1", min: "b1", max: "s1" },
+            { label: "Silver 5 ~ Gold 4", min: "s5", max: "g4" },
+            { label: "Gold 5 ~ Gold 4", min: "g5", max: "g4" },
+            { label: "직접 입력", min: "", max: "" },
+          ],
+          { placeHolder: "난이도 범위 선택" }
+        );
+
+        if (!tierPick) return;
+
+        let minTier = tierPick.min;
+        let maxTier = tierPick.max;
+
+        if (tierPick.label === "직접 입력") {
+          const minStr = (await vscode.window.showInputBox({
+            prompt: "min tier 입력 (예: b1, s5, g3, p2)",
+            ignoreFocusOut: true,
+            validateInput: (v) => (/^[bsgp][1-5]$/i.test(v.trim()) ? null : "예: b1, s5, g3, p2 형태로 입력하세요."),
+          }))?.trim().toLowerCase();
+
+          if (!minStr) return;
+
+          const maxStr = (await vscode.window.showInputBox({
+            prompt: "max tier 입력 (예: g4)",
+            ignoreFocusOut: true,
+            validateInput: (v) => (/^[bsgp][1-5]$/i.test(v.trim()) ? null : "예: b1, s5, g3, p2 형태로 입력하세요."),
+          }))?.trim().toLowerCase();
+
+          if (!maxStr) return;
+
+          minTier = minStr;
+          maxTier = maxStr;
+        }
+
+        const candidates = await fetchCandidates(handles, minTier, maxTier);
+        if (candidates.length < problemCount) {
+          vscode.window.showWarningMessage(`조건에 맞는 문제가 ${problemCount}개 미만입니다.`);
+          return;
+        }
+
+        const valid = await pickValidByFetching(
+          candidates.map((x) => ({ problemId: x.problemId, title: x.title })),
+          problemCount,
+          { requireSamples: true, maxTryMultiplier: 50 }
+        );
+
+        if (valid.length < problemCount) {
+          vscode.window.showWarningMessage(`조건에 맞는 "유효한 문제"를 충분히 찾지 못했습니다. (찾음: ${valid.length}/${problemCount})`);
+          return;
+        }
+
+        picked = valid;
+        hideMeta = true;
+
+        const timeStr = await vscode.window.showInputBox({
+          prompt: "시험 시간(분)",
+          value: "90",
+          ignoreFocusOut: true,
+          validateInput: (v) => (/^\d+$/.test(v.trim()) ? null : "숫자(분)만 입력하세요."),
+        });
+
+        if (!timeStr) return;
+        minutes = Number(timeStr);
+
+        const code = encodeSharedCode({
+          v: 1,
+          problemIds: picked.map((p) => p.problemId),
+          minutes,
+          hideMeta,
+        });
+
+        await vscode.window.showInputBox({
+          prompt: "입장 코드 (복사해서 공유하세요)",
+          value: code,
+          ignoreFocusOut: true,
+        });
+      }
+    } else {
+      const mode = await vscode.window.showQuickPick(
+        [
+          { label: "랜덤 문제", value: "random" as const },
+          { label: "문제 번호 직접 입력", value: "manual" as const },
+        ],
+        { placeHolder: "모드 선택" }
+      );
+      if (!mode) return;
+
+      const countStr = await vscode.window.showInputBox({
+        prompt: "문제 개수",
+        value: "3",
+        ignoreFocusOut: true,
+        validateInput: (v) => {
+          if (!/^\d+$/.test(v.trim())) return "숫자를 입력하세요.";
+          const n = Number(v);
+          if (n <= 0) return "1 이상이어야 합니다.";
+          if (n > 10) return "최대 10문제까지 가능합니다.";
+          return null;
+        },
+      });
+      if (!countStr) return;
+
+      const problemCount = Number(countStr);
+      hideMeta = mode.value === "random";
+
+      if (mode.value === "manual") {
+        const idsStr = await vscode.window.showInputBox({
+          prompt: `문제 번호 ${problemCount}개 (예: 1000, 2557, ...)`,
+          ignoreFocusOut: true,
+          validateInput: (v) => {
+            const ids = v.split(/[,\s]+/).filter(Boolean);
+            if (ids.length !== problemCount) return `문제 번호 ${problemCount}개를 입력하세요.`;
+            if (!ids.every((x) => /^\d+$/.test(x))) return "숫자만 입력하세요.";
+            return null;
+          },
+        });
+        if (!idsStr) return;
+
+        const ids = idsStr
+          .split(/[,\s]+/)
+          .filter(Boolean)
+          .map((x) => Number(x));
+
+        picked = ids.map((id) => ({ problemId: id, title: `BOJ ${id}` }));
+      } else {
+        const handles = await askHandlesList("백준 핸들(콤마 구분) 입력");
+        if (!handles) return;
+
+        const tierPick = await vscode.window.showQuickPick(
+          [
+            { label: "Bronze 1 ~ Gold 4", min: "b1", max: "g4" },
+            { label: "Bronze 1 ~ Silver 1", min: "b1", max: "s1" },
+            { label: "Silver 5 ~ Gold 4", min: "s5", max: "g4" },
+            { label: "Gold 5 ~ Gold 4", min: "g5", max: "g4" },
+            { label: "직접 입력", min: "", max: "" },
+          ],
+          { placeHolder: "난이도 범위 선택" }
+        );
+
+        if (!tierPick) return;
+
+        let minTier = tierPick.min;
+        let maxTier = tierPick.max;
+
+        if (tierPick.label === "직접 입력") {
+          const minStr = (await vscode.window.showInputBox({
+            prompt: "min tier 입력 (예: b1, s5, g3, p2)",
+            ignoreFocusOut: true,
+            validateInput: (v) => (/^[bsgp][1-5]$/i.test(v.trim()) ? null : "예: b1, s5, g3, p2 형태로 입력하세요."),
+          }))?.trim().toLowerCase();
+
+          if (!minStr) return;
+
+          const maxStr = (await vscode.window.showInputBox({
+            prompt: "max tier 입력 (예: g4)",
+            ignoreFocusOut: true,
+            validateInput: (v) => (/^[bsgp][1-5]$/i.test(v.trim()) ? null : "예: b1, s5, g3, p2 형태로 입력하세요."),
+          }))?.trim().toLowerCase();
+
+          if (!maxStr) return;
+
+          minTier = minStr;
+          maxTier = maxStr;
+        }
+
+        const candidates = await fetchCandidates(handles, minTier, maxTier);
+        if (candidates.length < problemCount) {
+          vscode.window.showWarningMessage(`조건에 맞는 문제가 ${problemCount}개 미만입니다.`);
+          return;
+        }
+
+        const valid = await pickValidByFetching(
+          candidates.map((x) => ({ problemId: x.problemId, title: x.title })),
+          problemCount,
+          { requireSamples: true, maxTryMultiplier: 50 }
+        );
+
+        if (valid.length < problemCount) {
+          vscode.window.showWarningMessage(`조건에 맞는 "유효한 문제"를 충분히 찾지 못했습니다. (찾음: ${valid.length}/${problemCount})`);
+          return;
+        }
+
+        picked = valid;
+      }
+
+      const timeStr = await vscode.window.showInputBox({
+        prompt: "시험 시간(분)",
+        value: "90",
+        ignoreFocusOut: true,
+        validateInput: (v) => (/^\d+$/.test(v.trim()) ? null : "숫자(분)만 입력하세요."),
+      });
+
+      if (!timeStr) return;
+      minutes = Number(timeStr);
+    }
+
+    if (!picked.length || minutes <= 0) {
+      vscode.window.showErrorMessage("문제 또는 시간이 올바르지 않습니다.");
+      return;
+    }
+
+    const lang = await pickLanguage();
+    if (!lang) return;
+
+    await startSession(picked, minutes, hideMeta, lang);
   });
 
   context.subscriptions.push(disposable);
